@@ -13,92 +13,116 @@ st.set_page_config(
 )
 
 
-def apply_custom_css() -> None:
+def apply_custom_css(theme_mode: str) -> None:
+    is_dark = theme_mode.lower() == "dark"
+
+    if is_dark:
+        bg_a = "#0b1220"
+        bg_b = "#0f1a17"
+        ink = "#e7ecff"
+        ink_soft = "#9aa7c7"
+        line = "rgba(156, 172, 214, 0.2)"
+        panel = "rgba(18, 27, 48, 0.72)"
+        side_bg = "rgba(12, 18, 33, 0.7)"
+        shadow = "0 10px 35px rgba(0, 0, 0, 0.45)"
+    else:
+        bg_a = "#eef4ff"
+        bg_b = "#f8fff1"
+        ink = "#15182b"
+        ink_soft = "#58607a"
+        line = "rgba(30, 37, 72, 0.12)"
+        panel = "rgba(255, 255, 255, 0.72)"
+        side_bg = "rgba(255, 255, 255, 0.65)"
+        shadow = "0 8px 30px rgba(17, 24, 39, 0.06)"
+
     st.markdown(
-        """
+        f"""
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
-        :root {
-            --bg-a: #eef4ff;
-            --bg-b: #f8fff1;
-            --ink: #15182b;
-            --ink-soft: #58607a;
-            --line: rgba(30, 37, 72, 0.12);
+        :root {{
+            --bg-a: {bg_a};
+            --bg-b: {bg_b};
+            --ink: {ink};
+            --ink-soft: {ink_soft};
+            --line: {line};
             --accent: #0f9d8f;
             --accent-2: #2979ff;
-            --panel: rgba(255, 255, 255, 0.72);
-        }
+            --panel: {panel};
+            --side-bg: {side_bg};
+            --shadow: {shadow};
+        }}
 
-        .stApp {
+        .stApp {{
             font-family: 'Space Grotesk', sans-serif;
             color: var(--ink);
             background:
                 radial-gradient(circle at 10% 10%, rgba(41, 121, 255, 0.14), transparent 35%),
                 radial-gradient(circle at 90% 10%, rgba(15, 157, 143, 0.14), transparent 35%),
                 linear-gradient(135deg, var(--bg-a), var(--bg-b));
-        }
+            transition: background 0.25s ease;
+        }}
 
-        section[data-testid="stSidebar"] {
+        section[data-testid="stSidebar"] {{
             border-right: 1px solid var(--line);
-            background: rgba(255, 255, 255, 0.65);
+            background: var(--side-bg);
             backdrop-filter: blur(10px);
-        }
+        }}
 
-        .hero {
+        .hero {{
             padding: 18px 22px;
             border: 1px solid var(--line);
             border-radius: 18px;
             background: var(--panel);
             backdrop-filter: blur(8px);
-            box-shadow: 0 8px 30px rgba(17, 24, 39, 0.06);
+            box-shadow: var(--shadow);
             margin-bottom: 14px;
             animation: fadeIn 0.4s ease;
-        }
+        }}
 
-        .hero h1 {
+        .hero h1 {{
             margin: 0;
             font-size: 1.8rem;
             letter-spacing: 0.2px;
-        }
+        }}
 
-        .hero p {
+        .hero p {{
             margin: 6px 0 0;
             color: var(--ink-soft);
-        }
+        }}
 
-        .status-grid {
+        .status-grid {{
             display: grid;
             grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 10px;
             margin: 10px 0 18px;
-        }
+        }}
 
-        .status-card {
+        .status-card {{
             border: 1px solid var(--line);
             border-radius: 14px;
             background: var(--panel);
             padding: 12px;
-        }
+        }}
 
-        .status-label {
+        .status-label {{
             font-size: 0.72rem;
             text-transform: uppercase;
             color: var(--ink-soft);
             letter-spacing: 0.08em;
             margin-bottom: 6px;
-        }
+        }}
 
-        .status-value {
+        .status-value {{
             font-family: 'IBM Plex Mono', monospace;
             font-size: 1.02rem;
             font-weight: 500;
-        }
+        }}
 
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(8px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
+        @keyframes fadeIn {{
+            from {{ opacity: 0; transform: translateY(8px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -156,15 +180,21 @@ def render_header(engine: AdvanceRAG | None) -> None:
 
 
 def main() -> None:
-    apply_custom_css()
-
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+    if "theme_mode" not in st.session_state:
+        st.session_state.theme_mode = "Light"
 
     audio_ok, audio_status = is_audio_transcription_available()
 
     with st.sidebar:
         st.subheader("Engine")
+        st.session_state.theme_mode = st.toggle(
+            "Dark Theme",
+            value=st.session_state.theme_mode == "Dark",
+        )
+        theme_mode = "Dark" if st.session_state.theme_mode else "Light"
+
         default_key = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else ""
         api_key = st.text_input(
             "GROQ API Key",
@@ -186,6 +216,8 @@ def main() -> None:
 
         process_files = st.button("Process + Build Index", use_container_width=True, type="primary")
         clear_kb = st.button("Clear Knowledge Base", use_container_width=True)
+
+    apply_custom_css(theme_mode)
 
     engine = None
     if api_key:
