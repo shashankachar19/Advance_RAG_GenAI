@@ -10,13 +10,17 @@ A modern Retrieval-Augmented Generation (RAG) app built from your notebook workf
 
 ## Features
 
-- Ingest files: `.txt`, `.md`, `.pdf`, `.wav`, `.mp3`, `.mp4`, `.m4a`, `.flac`, `.ogg`
+- Ingest files: `.txt`, `.md`, `.pdf`, `.wav`, `.mp3`, `.mp4`, `.m4a`, `.flac`, `.ogg`, `.png`, `.jpg`, `.jpeg`, `.webp`
 - Audio transcription via Whisper
 - Text chunking by words
-- Embeddings via TF-IDF (`scikit-learn`)
+- Multimodal RAG with image captions (Groq vision model)
+- Embeddings via Jina Embeddings v4 API
 - Vector search with FAISS
-- Grounded generation with Groq chat models
-- Chat interface with retrieved context visibility
+- Cross-encoder reranking for improved relevance
+- Guardrails for context-only answers
+- Session memory and latency tracking in the UI
+- Optional vision-at-answer for image Q&A plus image previews in context
+- Metadata filtering (text-only / image-only / both)
 
 ## Setup
 
@@ -26,13 +30,14 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Set your API key:
+Set your API keys:
 
 ```bash
 set GROQ_API_KEY=your_groq_api_key_here
+set JINA_API_KEY=your_jina_api_key_here
 ```
 
-Or provide it in the Streamlit sidebar at runtime.
+Or provide them in the Streamlit sidebar at runtime.
 
 ## Run UI
 
@@ -67,6 +72,7 @@ print(rag.answer("Summarize the key topics"))
 - Do not hardcode API keys in source files.
 - First run of Whisper may download model weights, so audio transcription can take longer.
 - For large files, prefer smaller `top_k` and tune `chunk_size` from the UI sidebar.
+- Cross-encoder reranking uses `sentence-transformers` and can add startup latency on first load.
 
 ## Streamlit Cloud Deployment
 
@@ -76,6 +82,7 @@ print(rag.answer("Summarize the key topics"))
 
 ```toml
 GROQ_API_KEY = "your_groq_api_key_here"
+JINA_API_KEY = "your_jina_api_key_here"
 ```
 
 4. Deploy.

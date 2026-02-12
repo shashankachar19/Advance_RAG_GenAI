@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 import streamlit as st
 
-from main import AdvanceRAG, SUPPORTED_AUDIO_SUFFIXES, is_audio_transcription_available
+from main import (
+    AdvanceRAG,
+    SUPPORTED_AUDIO_SUFFIXES,
+    SUPPORTED_IMAGE_SUFFIXES,
+    is_audio_transcription_available,
+)
 
 
 st.set_page_config(
@@ -129,14 +134,25 @@ def apply_custom_css(theme_mode: str) -> None:
     )
 
 
-def get_engine(api_key: str, model: str, chunk_size: int, top_k: int) -> AdvanceRAG:
-    signature = (api_key, model, chunk_size, top_k)
+def get_engine(
+    groq_api_key: str,
+    jina_api_key: str,
+    model: str,
+    vision_model: str,
+    chunk_size: int,
+    top_k: int,
+    rerank_model: str,
+) -> AdvanceRAG:
+    signature = (groq_api_key, jina_api_key, model, vision_model, chunk_size, top_k, rerank_model)
     if st.session_state.get("engine_signature") != signature:
         st.session_state.engine = AdvanceRAG(
-            groq_api_key=api_key,
+            groq_api_key=groq_api_key,
+            jina_api_key=jina_api_key,
             model=model,
+            vision_model=vision_model,
             chunk_size=chunk_size,
             top_k=top_k,
+            rerank_model=rerank_model,
         )
         st.session_state.engine_signature = signature
         st.session_state.chat_history = []
@@ -145,7 +161,9 @@ def get_engine(api_key: str, model: str, chunk_size: int, top_k: int) -> Advance
 
 def render_header(engine: AdvanceRAG | None) -> None:
     chunk_count = len(engine.chunks) if engine else 0
-    source_count = len(set(engine.chunk_sources)) if engine else 0
+    text_count = sum(1 for chunk in engine.chunks if chunk.modality == "text") if engine else 0
+    image_count = sum(1 for chunk in engine.chunks if chunk.modality == "image") if engine else 0
+    source_count = len({chunk.source for chunk in engine.chunks}) if engine else 0
     index_state = "Ready" if engine and engine.is_ready else "Not Ready"
 
     st.markdown(
@@ -177,6 +195,7 @@ def render_header(engine: AdvanceRAG | None) -> None:
         """,
         unsafe_allow_html=True,
     )
+    st.caption(f"Text chunks: {text_count} - Image chunks: {image_count}")
 
 
 def main() -> None:
@@ -195,22 +214,59 @@ def main() -> None:
         )
         theme_mode = "Dark" if st.session_state.theme_mode else "Light"
 
-        default_key = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else ""
-        api_key = st.text_input(
+        st.subheader("API Keys")
+        default_groq_key = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else ""
+        groq_api_key = st.text_input(
             "GROQ API Key",
             type="password",
-            value=default_key,
+            value=default_groq_key,
             help="Used in this session. Prefer Streamlit secrets in deployment.",
         )
+        default_jina_key = st.secrets.get("JINA_API_KEY", "") if hasattr(st, "secrets") else ""
+        jina_api_key = st.text_input(
+            "Jina API Key",
+            type="password",
+            value=default_jina_key,
+            help="Used for embeddings. Prefer Streamlit secrets in deployment.",
+        )
+
+        st.divider()
+        st.subheader("Models")
         model = st.selectbox("Model", ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mixtral-8x7b-32768"], index=0)
+        vision_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        st.caption(f"Vision model: {vision_model}")
+        rerank_model = st.selectbox(
+            "Reranker",
+            ["cross-encoder/ms-marco-MiniLM-L-6-v2", "cross-encoder/ms-marco-MiniLM-L-12-v2"],
+            index=0,
+        )
         chunk_size = st.slider("Chunk Size (words)", min_value=120, max_value=900, value=400, step=20)
         top_k = st.slider("Top K Retrieval", min_value=1, max_value=8, value=3, step=1)
+        candidate_k = st.slider("Candidate K (before rerank)", min_value=3, max_value=20, value=8, step=1)
+        use_rerank = st.toggle("Use Cross-Encoder Rerank", value=True)
+        modality_filter = st.selectbox("Retrieve", ["both", "text", "image"], index=0)
+        use_vision = st.toggle("Use Vision for Image Q&A", value=True)
+        memory_turns = st.slider("Memory Turns", min_value=0, max_value=8, value=4, step=1)
 
         st.divider()
         st.subheader("Knowledge Files")
         uploads = st.file_uploader(
             "Upload one or more files",
-            type=["txt", "md", "pdf", "wav", "mp3", "mp4", "m4a", "flac", "ogg"],
+            type=[
+                "txt",
+                "md",
+                "pdf",
+                "wav",
+                "mp3",
+                "mp4",
+                "m4a",
+                "flac",
+                "ogg",
+                "png",
+                "jpg",
+                "jpeg",
+                "webp",
+            ],
             accept_multiple_files=True,
         )
 
@@ -220,9 +276,17 @@ def main() -> None:
     apply_custom_css(theme_mode)
 
     engine = None
-    if api_key:
+    if groq_api_key and jina_api_key:
         try:
-            engine = get_engine(api_key, model, chunk_size, top_k)
+            engine = get_engine(
+                groq_api_key,
+                jina_api_key,
+                model,
+                vision_model,
+                chunk_size,
+                top_k,
+                rerank_model,
+            )
         except Exception as exc:
             st.error(f"Unable to initialize engine: {exc}")
             return
@@ -238,8 +302,8 @@ def main() -> None:
         st.caption(f"Audio note: {audio_status} Audio files will be skipped.")
 
     if process_files:
-        if not api_key:
-            st.warning("Add your GROQ API key before processing files.")
+        if not groq_api_key or not jina_api_key:
+            st.warning("Add both GROQ and Jina API keys before processing files.")
         elif not uploads:
             st.warning("Upload at least one file first.")
         else:
@@ -255,6 +319,8 @@ def main() -> None:
                             added += engine.ingest_txt_bytes(data, source=file_name)
                         elif suffix == ".pdf":
                             added += engine.ingest_pdf_bytes(data, source=file_name)
+                        elif suffix in SUPPORTED_IMAGE_SUFFIXES:
+                            added += engine.ingest_image_bytes(data, source=file_name)
                         elif suffix in SUPPORTED_AUDIO_SUFFIXES:
                             if not audio_ok:
                                 st.warning(f"Skipped {file_name}: {audio_status}")
@@ -275,8 +341,8 @@ def main() -> None:
 
     st.subheader("Chat")
 
-    if not api_key:
-        st.info("Enter your GROQ API key in the sidebar to start.")
+    if not groq_api_key or not jina_api_key:
+        st.info("Enter your GROQ + Jina API keys in the sidebar to start.")
 
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
@@ -284,8 +350,10 @@ def main() -> None:
             if message.get("context"):
                 with st.expander("Retrieved Context"):
                     for idx, ctx in enumerate(message["context"], start=1):
-                        st.caption(f"Chunk {idx}")
-                        st.write(ctx)
+                        st.caption(f"Chunk {idx} - {ctx.get('modality', 'text')} - {ctx.get('source', 'source')}")
+                        st.write(ctx.get("text", ""))
+                        if ctx.get("modality") == "image" and ctx.get("meta", {}).get("image_b64"):
+                            st.image(ctx["meta"]["image_b64"], caption=ctx.get("meta", {}).get("image", ""))
 
     user_query = st.chat_input("Ask a question about your uploaded knowledge base...")
     if user_query:
@@ -300,19 +368,41 @@ def main() -> None:
         with st.chat_message("assistant"):
             with st.spinner("Generating grounded answer..."):
                 try:
-                    result = engine.answer(user_query, top_k=top_k)
+                    candidate_k = max(candidate_k, top_k)
+                    memory = []
+                    if memory_turns > 0:
+                        memory = st.session_state.chat_history[:-1]
+                        memory = memory[-(memory_turns * 2) :]
+                    result = engine.answer(
+                        user_query,
+                        top_k=top_k,
+                        candidate_k=candidate_k,
+                        modality_filter=modality_filter,
+                        use_rerank=use_rerank,
+                        use_vision=use_vision,
+                        memory=memory,
+                    )
                     answer = result["answer"]
                     context_docs = result["context_docs"]
+                    latency = result.get("latency", {})
                 except Exception as exc:
                     answer = f"Error while generating answer: {exc}"
                     context_docs = []
+                    latency = {}
 
             st.markdown(answer)
             if context_docs:
                 with st.expander("Retrieved Context"):
                     for idx, ctx in enumerate(context_docs, start=1):
-                        st.caption(f"Chunk {idx}")
-                        st.write(ctx)
+                        st.caption(f"Chunk {idx} - {ctx.get('modality', 'text')} - {ctx.get('source', 'source')}")
+                        st.write(ctx.get("text", ""))
+                        if ctx.get("modality") == "image" and ctx.get("meta", {}).get("image_b64"):
+                            st.image(ctx["meta"]["image_b64"], caption=ctx.get("meta", {}).get("image", ""))
+
+            if latency:
+                with st.expander("Latency Breakdown"):
+                    for key, value in latency.items():
+                        st.write(f"{key}: {value:.2f}s")
 
         st.session_state.chat_history.append(
             {"role": "assistant", "content": answer, "context": context_docs}
