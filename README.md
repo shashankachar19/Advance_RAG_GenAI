@@ -17,9 +17,15 @@ A modern Retrieval-Augmented Generation (RAG) app built from your notebook workf
 - Embeddings via Jina Embeddings v4 API
 - Vector search with FAISS
 - Cross-encoder reranking for improved relevance
-- Guardrails for context-only answers
+- Guardrails for context-only answers with post-generation grounding validation
 - Session memory and latency tracking in the UI
 - Optional vision-at-answer for image Q&A plus image previews in context
+- Ingestion/index latency panel plus answer-stage latency panel
+- Document-level metadata filters: source, file type, page, and safe-content mode
+- Built-in evaluation panel with answer match, retrieval recall, grounding rate, and latency
+- Per-model telemetry (latency, tokens, grounding rate, estimated cost) with manual/auto routing
+- Safety policy filters for PII redaction and prompt-injection detection tags
+- Analytics tab with latency timeline, model comparison, source contribution, retrieval score view, and safety dashboard
 - Metadata filtering (text-only / image-only / both)
 
 ## Setup
