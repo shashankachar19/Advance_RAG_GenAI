@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 import base64
+from datetime import datetime, timezone
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -121,6 +123,8 @@ class AdvanceRAG:
 
         self.chunks: list[ChunkRecord] = []
         self.index: faiss.IndexFlatL2 | None = None
+        self.modality_indices: dict[str, faiss.IndexFlatL2] = {}
+        self.modality_chunk_maps: dict[str, list[int]] = {}
         self.emb_matrix: np.ndarray | None = None
         self._reranker = None
 
@@ -131,6 +135,8 @@ class AdvanceRAG:
     def reset(self) -> None:
         self.chunks = []
         self.index = None
+        self.modality_indices = {}
+        self.modality_chunk_maps = {}
         self.emb_matrix = None
 
     def ingest_text(self, text: str, source: str = "text", meta: dict[str, Any] | None = None) -> int:
@@ -138,32 +144,38 @@ class AdvanceRAG:
         if not cleaned:
             return 0
 
-        new_chunks = _chunk_by_words(cleaned, self.chunk_size)
+        merged_meta = self._build_base_meta(source, meta)
+        policy_flags = scan_policy_flags(cleaned)
+        merged_meta.update(policy_flags)
+        processed_text = redact_pii(cleaned)
+
+        new_chunks = _chunk_by_words(processed_text, self.chunk_size)
         for chunk in new_chunks:
             self.chunks.append(
                 ChunkRecord(
                     text=chunk,
                     source=source,
                     modality="text",
-                    meta=meta or {},
+                    meta=dict(merged_meta),
                 )
             )
         return len(new_chunks)
 
     def ingest_txt_bytes(self, data: bytes, source: str = "text.txt") -> int:
         text = data.decode("utf-8", errors="ignore")
-        return self.ingest_text(text, source=source)
+        return self.ingest_text(text, source=source, meta={"file_type": "txt"})
 
     def ingest_pdf_bytes(self, data: bytes, source: str = "document.pdf") -> int:
         added = 0
-        text_parts: list[str] = []
         with pdfplumber.open(BytesIO(data)) as pdf:
-            for page in pdf.pages:
+            for page_num, page in enumerate(pdf.pages, start=1):
                 page_text = page.extract_text() or ""
                 if page_text.strip():
-                    text_parts.append(page_text)
-        if text_parts:
-            added += self.ingest_text("\n".join(text_parts), source=source, meta={"type": "pdf"})
+                    added += self.ingest_text(
+                        page_text,
+                        source=source,
+                        meta={"file_type": "pdf", "page": page_num, "source_name": source},
+                    )
 
         added += self._ingest_pdf_images(data, source=source)
         return added
@@ -174,12 +186,16 @@ class AdvanceRAG:
             return 0
         image_b64 = base64.b64encode(data).decode("ascii")
         formatted = f"[Image: {source}] {caption}"
+        merged_meta = self._build_base_meta(source, {"file_type": _suffix_to_file_type(source), "source_name": source})
+        merged_meta.update(scan_policy_flags(caption))
+        merged_meta["caption"] = caption
+        merged_meta["image_b64"] = image_b64
         self.chunks.append(
             ChunkRecord(
                 text=formatted,
                 source=source,
                 modality="image",
-                meta={"caption": caption, "image_b64": image_b64},
+                meta=merged_meta,
             )
         )
         return 1
@@ -255,12 +271,14 @@ class AdvanceRAG:
         self.emb_matrix = emb_array
         self.index = faiss.IndexFlatL2(emb_array.shape[1])
         self.index.add(emb_array)
+        self._build_modality_indices()
 
     def retrieve(
         self,
         query: str,
         top_k: int | None = None,
         modality_filter: str = "both",
+        metadata_filter: dict[str, Any] | None = None,
     ) -> list[ChunkRecord]:
         if not self.is_ready or self.index is None or self.emb_matrix is None:
             raise ValueError("Index is not ready. Build the index before querying.")
@@ -268,28 +286,46 @@ class AdvanceRAG:
         k = top_k or self.top_k
         query_emb = self.embeddings.embed_texts([query], task="retrieval.query")[0]
         q_vec = np.asarray([query_emb], dtype="float32")
-        _, indices = self.index.search(q_vec, k)
+        index, map_back = self._select_index_for_filter(modality_filter)
+        if index is None or index.ntotal == 0:
+            return []
 
+        filter_cfg = metadata_filter or {}
+        search_k = min(index.ntotal, max(k, k * 4))
         results: list[ChunkRecord] = []
-        for idx in indices[0]:
-            if idx == -1:
-                continue
-            record = self.chunks[int(idx)]
-            if modality_filter == "text" and record.modality != "text":
-                continue
-            if modality_filter == "image" and record.modality != "image":
-                continue
-            results.append(record)
-        return results
+
+        while search_k <= index.ntotal and len(results) < k:
+            _, indices = index.search(q_vec, search_k)
+            seen: set[int] = set()
+            filtered: list[ChunkRecord] = []
+            for local_idx in indices[0]:
+                if local_idx == -1:
+                    continue
+                chunk_idx = int(local_idx) if map_back is None else map_back[int(local_idx)]
+                if chunk_idx in seen:
+                    continue
+                seen.add(chunk_idx)
+                record = self.chunks[chunk_idx]
+                if self._record_matches_filters(record, filter_cfg):
+                    filtered.append(record)
+                if len(filtered) >= k:
+                    break
+            results = filtered
+            if len(results) >= k or search_k == index.ntotal:
+                break
+            search_k = min(index.ntotal, search_k * 2)
+
+        return results[:k]
 
     def rerank(
         self,
         query: str,
         docs: list[ChunkRecord],
         top_k: int,
-    ) -> list[ChunkRecord]:
+        return_scores: bool = False,
+    ) -> list[ChunkRecord] | tuple[list[ChunkRecord], list[float]]:
         if not docs:
-            return []
+            return ([], []) if return_scores else []
 
         if self._reranker is None:
             try:
@@ -301,8 +337,12 @@ class AdvanceRAG:
 
         pairs = [(query, doc.text) for doc in docs]
         scores = self._reranker.predict(pairs)
-        ranked = [doc for _, doc in sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)]
-        return ranked[:top_k]
+        ranked_pairs = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+        ranked_docs = [doc for _, doc in ranked_pairs][:top_k]
+        ranked_scores = [float(score) for score, _ in ranked_pairs][:top_k]
+        if return_scores:
+            return ranked_docs, ranked_scores
+        return ranked_docs
 
     def answer(
         self,
@@ -312,6 +352,9 @@ class AdvanceRAG:
         modality_filter: str = "both",
         use_rerank: bool = True,
         use_vision: bool = False,
+        enforce_guardrails: bool = True,
+        answer_model: str | None = None,
+        metadata_filter: dict[str, Any] | None = None,
         memory: list[dict[str, str]] | None = None,
         temperature: float = 0.0,
     ) -> dict:
@@ -319,21 +362,33 @@ class AdvanceRAG:
         start_total = time.perf_counter()
 
         start_retrieval = time.perf_counter()
-        candidates = self.retrieve(query, top_k=candidate_k or (top_k or self.top_k), modality_filter=modality_filter)
+        candidates = self.retrieve(
+            query,
+            top_k=candidate_k or (top_k or self.top_k),
+            modality_filter=modality_filter,
+            metadata_filter=metadata_filter,
+        )
         timing["retrieval_s"] = time.perf_counter() - start_retrieval
 
         docs = candidates
+        retrieval_scores: list[float] = []
         if use_rerank:
             start_rerank = time.perf_counter()
-            docs = self.rerank(query, candidates, top_k or self.top_k)
+            docs, retrieval_scores = self.rerank(
+                query,
+                candidates,
+                top_k or self.top_k,
+                return_scores=True,
+            )
             timing["rerank_s"] = time.perf_counter() - start_rerank
 
         context = "\n\n".join([doc.text for doc in docs])
         memory_section = _format_memory(memory or [])
+        fallback = "I do not have enough context to answer that."
 
         system_msg = (
             "You are a grounded assistant. Answer ONLY using the provided context. "
-            "If the answer is not present, reply: 'I do not have enough context to answer that.'"
+            f"If the answer is not present, reply: '{fallback}'"
         )
         user_msg = (
             f"{memory_section}\n"
@@ -342,13 +397,14 @@ class AdvanceRAG:
             "Answer:"
         )
 
+        chosen_model = answer_model or self.model
         start_gen = time.perf_counter()
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         if use_vision and any(doc.modality == "image" for doc in docs):
-            response = self._answer_with_vision(system_msg, user_msg, docs, temperature)
-            answer_text = response
+            answer_text, usage = self._answer_with_vision(system_msg, user_msg, docs, temperature)
         else:
             response = self.client.chat.completions.create(
-                model=self.model,
+                model=chosen_model,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
@@ -356,13 +412,31 @@ class AdvanceRAG:
                 temperature=temperature,
             )
             answer_text = response.choices[0].message.content
+            if getattr(response, "usage", None):
+                usage["prompt_tokens"] = int(getattr(response.usage, "prompt_tokens", 0) or 0)
+                usage["completion_tokens"] = int(getattr(response.usage, "completion_tokens", 0) or 0)
+                usage["total_tokens"] = int(getattr(response.usage, "total_tokens", 0) or 0)
         timing["generation_s"] = time.perf_counter() - start_gen
+
+        grounded = True
+        if enforce_guardrails:
+            start_guard = time.perf_counter()
+            is_grounded = self._is_grounded_answer(query, context, answer_text, fallback, chosen_model)
+            timing["guardrail_s"] = time.perf_counter() - start_guard
+            grounded = bool(is_grounded)
+            if not is_grounded:
+                answer_text = fallback
+
         timing["total_s"] = time.perf_counter() - start_total
 
         return {
             "answer": answer_text,
             "context_docs": [doc.__dict__ for doc in docs],
             "latency": timing,
+            "usage": usage,
+            "model_used": chosen_model,
+            "grounded": grounded,
+            "retrieval_scores": retrieval_scores,
         }
 
     def _ingest_pdf_images(self, data: bytes, source: str) -> int:
@@ -395,17 +469,19 @@ class AdvanceRAG:
                         text=formatted,
                         source=source,
                         modality="image",
-                        meta={
-                            "caption": caption,
-                            "page": page_index + 1,
-                            "image": name,
-                            "image_b64": image_b64,
-                        },
+                        meta=self._build_pdf_image_meta(source, page_index + 1, name, caption, image_b64),
                     )
                 )
                 added += 1
         doc.close()
         return added
+
+    def has_pdf_image_support(self) -> bool:
+        try:
+            import fitz  # noqa: F401
+            return True
+        except Exception:
+            return False
 
     def _answer_with_vision(
         self,
@@ -413,7 +489,7 @@ class AdvanceRAG:
         user_msg: str,
         docs: list[ChunkRecord],
         temperature: float,
-    ) -> str:
+    ) -> tuple[str, dict[str, int]]:
         content: list[dict[str, str]] = [{"type": "input_text", "text": f"{system_msg}\n\n{user_msg}"}]
         for doc in docs:
             if doc.modality != "image":
@@ -433,7 +509,114 @@ class AdvanceRAG:
             input=[{"role": "user", "content": content}],
             temperature=temperature,
         )
-        return (response.output_text or "").strip()
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        resp_usage = getattr(response, "usage", None)
+        if resp_usage:
+            usage["prompt_tokens"] = int(getattr(resp_usage, "input_tokens", 0) or 0)
+            usage["completion_tokens"] = int(getattr(resp_usage, "output_tokens", 0) or 0)
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        return (response.output_text or "").strip(), usage
+
+    def _build_modality_indices(self) -> None:
+        if self.emb_matrix is None or len(self.chunks) == 0:
+            self.modality_indices = {}
+            self.modality_chunk_maps = {}
+            return
+
+        dim = self.emb_matrix.shape[1]
+        self.modality_indices = {}
+        self.modality_chunk_maps = {}
+
+        for modality in ("text", "image"):
+            chunk_ids = [idx for idx, chunk in enumerate(self.chunks) if chunk.modality == modality]
+            if not chunk_ids:
+                continue
+            sub_embs = self.emb_matrix[chunk_ids]
+            sub_index = faiss.IndexFlatL2(dim)
+            sub_index.add(sub_embs)
+            self.modality_indices[modality] = sub_index
+            self.modality_chunk_maps[modality] = chunk_ids
+
+    def _select_index_for_filter(
+        self,
+        modality_filter: str,
+    ) -> tuple[faiss.IndexFlatL2 | None, list[int] | None]:
+        if modality_filter == "both":
+            return self.index, None
+        if modality_filter in self.modality_indices:
+            return self.modality_indices[modality_filter], self.modality_chunk_maps[modality_filter]
+        return None, None
+
+    def _is_grounded_answer(self, query: str, context: str, answer: str, fallback: str, judge_model: str) -> bool:
+        normalized = (answer or "").strip()
+        if not normalized:
+            return False
+        if normalized == fallback:
+            return True
+        if not context.strip():
+            return False
+
+        judge_prompt = (
+            "Decide if the answer is fully supported by the context.\n"
+            "Reply with exactly SUPPORTED or UNSUPPORTED.\n\n"
+            f"Question:\n{query}\n\n"
+            f"Context:\n{context}\n\n"
+            f"Answer:\n{answer}\n"
+        )
+        try:
+            verdict = self.client.chat.completions.create(
+                model=judge_model,
+                messages=[{"role": "user", "content": judge_prompt}],
+                temperature=0.0,
+            ).choices[0].message.content
+        except Exception:
+            return False
+        return "SUPPORTED" in (verdict or "").upper()
+
+    def _record_matches_filters(self, record: ChunkRecord, filters: dict[str, Any]) -> bool:
+        source = (filters.get("source") or "").strip().lower()
+        if source and source not in record.source.lower():
+            return False
+
+        file_type = (filters.get("file_type") or "").strip().lower()
+        if file_type and str(record.meta.get("file_type", "")).lower() != file_type:
+            return False
+
+        page = filters.get("page")
+        if page is not None and page != "":
+            try:
+                page_num = int(page)
+            except Exception:
+                page_num = None
+            if page_num is not None and int(record.meta.get("page", -1)) != page_num:
+                return False
+
+        safe_only = bool(filters.get("safe_only", False))
+        if safe_only and bool(record.meta.get("has_prompt_injection", False)):
+            return False
+
+        return True
+
+    def _build_base_meta(self, source: str, meta: dict[str, Any] | None) -> dict[str, Any]:
+        base = dict(meta or {})
+        base.setdefault("source_name", source)
+        base.setdefault("file_type", _suffix_to_file_type(source))
+        base.setdefault("upload_ts", utc_now_iso())
+        return base
+
+    def _build_pdf_image_meta(
+        self,
+        source: str,
+        page: int,
+        image_name: str,
+        caption: str,
+        image_b64: str,
+    ) -> dict[str, Any]:
+        meta = self._build_base_meta(source, {"file_type": "pdf", "page": page, "image": image_name})
+        meta.update(scan_policy_flags(caption))
+        meta["caption"] = caption
+        meta["image_b64"] = image_b64
+        return meta
 
 
 def _normalize_text(text: str) -> str:
@@ -465,3 +648,43 @@ def _format_memory(memory: list[dict[str, str]]) -> str:
         content = item.get("content", "")
         lines.append(f"{role.title()}: {content}")
     return "\n".join(lines) + "\n\n"
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _suffix_to_file_type(source: str) -> str:
+    suffix = Path(source).suffix.lower().lstrip(".")
+    return suffix or "text"
+
+
+PII_PATTERNS = [
+    re.compile(r"\b[\w\.-]+@[\w\.-]+\.\w+\b"),
+    re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b"),
+    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+]
+
+PROMPT_INJECTION_PATTERNS = [
+    re.compile(r"ignore\s+previous\s+instructions", re.IGNORECASE),
+    re.compile(r"system\s+prompt", re.IGNORECASE),
+    re.compile(r"developer\s+message", re.IGNORECASE),
+    re.compile(r"do\s+not\s+follow\s+the\s+above", re.IGNORECASE),
+]
+
+
+def scan_policy_flags(text: str) -> dict[str, Any]:
+    has_pii = any(pattern.search(text) for pattern in PII_PATTERNS)
+    has_prompt_injection = any(pattern.search(text) for pattern in PROMPT_INJECTION_PATTERNS)
+    return {
+        "has_pii": bool(has_pii),
+        "has_prompt_injection": bool(has_prompt_injection),
+    }
+
+
+def redact_pii(text: str) -> str:
+    redacted = text
+    redacted = re.sub(PII_PATTERNS[0], "[REDACTED_EMAIL]", redacted)
+    redacted = re.sub(PII_PATTERNS[1], "[REDACTED_PHONE]", redacted)
+    redacted = re.sub(PII_PATTERNS[2], "[REDACTED_SSN]", redacted)
+    return redacted
